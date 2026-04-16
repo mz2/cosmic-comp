@@ -169,46 +169,47 @@ impl State {
         // Check if input capture is active - if so, redirect most input events
         // to the EIS connection instead of processing them normally.
         // The force-disable shortcut (Super+Shift+Escape) is always checked first.
-        if let Some(ref ic_state) = self.common.input_capture_state {
-            if let Ok(mut state) = ic_state.lock() {
-                if let Some(ref active_session_id) = state.active_session.clone() {
-                    // Check for force-disable shortcut (Super+Shift+Escape)
-                    if let InputEvent::Keyboard { ref event, .. } = event {
-                        use smithay::backend::input::KeyboardKeyEvent;
-                        let keycode = event.key_code();
-                        // Escape key code is 1 (evdev), keysym check is more reliable
-                        // but we need raw code here since we don't have the keyboard state
-                        // Keycode 1 = Escape in evdev
-                        if keycode == Keycode::new(1) && event.state() == KeyState::Pressed {
-                            // Check if Super+Shift are held by checking keyboard modifiers
-                            let shell = self.common.shell.read();
-                            let seat = shell.seats.last_active().clone();
-                            let keyboard = seat.get_keyboard().unwrap();
-                            let mods = keyboard.modifier_state();
-                            std::mem::drop(shell);
-                            if mods.logo && mods.shift {
-                                // Force-disable input capture
-                                tracing::warn!("Force-disabling input capture (Super+Shift+Escape)");
-                                if let Some(session) = state.sessions.get_mut(active_session_id) {
-                                    session.state = crate::dbus::input_capture::CaptureSessionState::Disabled;
-                                }
-                                state.active_session = None;
-                                // TODO: Emit Disabled signal on D-Bus
-                                // TODO: Stop EIS event forwarding
-                                return;
-                            }
-                        }
-                        // During active capture, keyboard events go to EIS
-                        // TODO: Forward keyboard event to EIS connection
-                        trace!("Input capture active, redirecting keyboard event to EIS");
-                        return;
+        {
+            let capture_active = self.common.input_capture_state.as_ref()
+                .and_then(|ic| ic.lock().ok())
+                .as_ref()
+                .and_then(|state| state.active_session.clone());
+
+            if let Some(active_session_id) = capture_active {
+                // Check for force-disable shortcut (Super+Shift+Escape)
+                let is_escape_shortcut = if let InputEvent::Keyboard { ref event, .. } = event {
+                    use smithay::backend::input::KeyboardKeyEvent;
+                    let keycode = event.key_code();
+                    if keycode == Keycode::new(1) && event.state() == KeyState::Pressed {
+                        let shell = self.common.shell.read();
+                        let seat = shell.seats.last_active().clone();
+                        let keyboard = seat.get_keyboard().unwrap();
+                        let mods = keyboard.modifier_state();
+                        mods.logo && mods.shift
                     } else {
-                        // TODO: Forward pointer motion, button, scroll events to EIS
-                        // For now, drop them (they would go to the EIS client)
-                        trace!("Input capture active, redirecting input event to EIS");
-                        return;
+                        false
                     }
+                } else {
+                    false
+                };
+
+                if is_escape_shortcut {
+                    tracing::warn!("Force-disabling input capture (Super+Shift+Escape)");
+                    if let Some(ref ic_state) = self.common.input_capture_state {
+                        if let Ok(mut state) = ic_state.lock() {
+                            if let Some(session) = state.sessions.get_mut(&active_session_id) {
+                                session.state = crate::dbus::input_capture::CaptureSessionState::Disabled;
+                            }
+                            state.active_session = None;
+                        }
+                    }
+                    return;
                 }
+
+                // During active capture, all input events go to EIS
+                // TODO: Forward events to EIS connection
+                trace!("Input capture active, redirecting input event to EIS");
+                return;
             }
         }
 
@@ -396,57 +397,59 @@ impl State {
                     let original_position = position;
                     position += event.delta().as_global();
 
-                    // Check for input capture barrier crossing
-                    if let Some(ref ic_state) = self.common.input_capture_state {
-                        if let Ok(mut state) = ic_state.lock() {
-                            if state.active_session.is_none() {
-                                let from = (original_position.x, original_position.y);
-                                let to = (position.x, position.y);
-                                if let Some((barrier_id, session_id, intersection)) =
-                                    state.check_barrier_crossing(from, to)
-                                {
-                                    // Barrier crossed! Activate input capture
-                                    state.next_activation_id += 1;
-                                    let activation_id = state.next_activation_id;
-                                    if let Some(session) = state.sessions.get_mut(&session_id) {
-                                        session.state = crate::dbus::input_capture::CaptureSessionState::Activated;
-                                        session.activation_id = activation_id;
-                                    }
-                                    state.active_session = Some(session_id.clone());
-                                    tracing::info!(
-                                        barrier_id,
-                                        %session_id,
-                                        activation_id,
-                                        ?intersection,
-                                        "Input capture barrier crossed, activating"
-                                    );
-
-                                    // Clamp cursor to the barrier intersection point
-                                    position.x = intersection.0;
-                                    position.y = intersection.1;
-
-                                    // TODO: Emit Activated signal on the D-Bus interface
-                                    // TODO: Start forwarding input events to EIS
-
-                                    // Don't process further - cursor stays at barrier
-                                    std::mem::drop(state);
-                                    std::mem::drop(shell);
-                                    let serial = SERIAL_COUNTER.next_serial();
-                                    let time = smithay::backend::input::Event::time_msec(&event);
-                                    ptr.motion(
-                                        self,
-                                        under,
-                                        &MotionEvent {
-                                            location: position.as_logical(),
-                                            serial,
-                                            time,
-                                        },
-                                    );
-                                    ptr.frame(self);
-                                    return;
-                                }
-                            }
+                    // Check for input capture barrier crossing.
+                    // We must fully release the borrow on self.common before calling
+                    // ptr.motion/frame which need &mut self.
+                    let barrier_crossed = self.common.input_capture_state.as_ref().and_then(|ic_state| {
+                        let mut state = ic_state.lock().ok()?;
+                        if state.active_session.is_some() {
+                            return None;
                         }
+                        let from = (original_position.x, original_position.y);
+                        let to = (position.x, position.y);
+                        let (barrier_id, session_id, intersection) =
+                            state.check_barrier_crossing(from, to)?;
+
+                        // Activate the capture session
+                        state.next_activation_id += 1;
+                        let activation_id = state.next_activation_id;
+                        if let Some(session) = state.sessions.get_mut(&session_id) {
+                            session.state = crate::dbus::input_capture::CaptureSessionState::Activated;
+                            session.activation_id = activation_id;
+                        }
+                        state.active_session = Some(session_id.clone());
+                        tracing::info!(
+                            barrier_id,
+                            %session_id,
+                            activation_id,
+                            ?intersection,
+                            "Input capture barrier crossed, activating"
+                        );
+                        Some(intersection)
+                    });
+                    if let Some(intersection) = barrier_crossed {
+                        // Clamp cursor to the barrier intersection point
+                        position.x = intersection.0;
+                        position.y = intersection.1;
+
+                        // TODO: Emit Activated signal on the D-Bus interface
+                        // TODO: Start forwarding input events to EIS
+
+                        // Don't process further - cursor stays at barrier
+                        std::mem::drop(shell);
+                        let serial = SERIAL_COUNTER.next_serial();
+                        let time = smithay::backend::input::Event::time_msec(&event);
+                        ptr.motion(
+                            self,
+                            under,
+                            &MotionEvent {
+                                location: position.as_logical(),
+                                serial,
+                                time,
+                            },
+                        );
+                        ptr.frame(self);
+                        return;
                     }
 
                     let output = shell
