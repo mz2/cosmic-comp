@@ -975,11 +975,10 @@ impl State {
                 if let Some((x, y)) = cursor_position {
                     let shell = self.common.shell.read();
                     let seat = shell.seats.last_active().clone();
-                    if let Some(ptr) = seat.get_pointer() {
-                        let location = Point::from((x, y));
+                    if let Some(_ptr) = seat.get_pointer() {
                         std::mem::drop(shell);
                         // TODO: Actually warp the cursor via pointer.motion()
-                        tracing::info!(?location, "Warping cursor after input capture release");
+                        tracing::info!(x, y, "Warping cursor after input capture release");
                     }
                 }
             }

@@ -184,13 +184,14 @@ impl InputCaptureInterface {
 
         {
             let mut state = self.state.lock().unwrap();
+            let current_zone_set = state.zone_set;
             state.sessions.insert(
                 session_id.clone(),
                 CaptureSession {
                     state: CaptureSessionState::Created,
                     capabilities,
                     barriers: Vec::new(),
-                    zone_set: state.zone_set,
+                    zone_set: current_zone_set,
                     activation_id: 0,
                     eis_fd: None,
                 },

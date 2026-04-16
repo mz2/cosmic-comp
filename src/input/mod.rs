@@ -179,7 +179,7 @@ impl State {
                         // Escape key code is 1 (evdev), keysym check is more reliable
                         // but we need raw code here since we don't have the keyboard state
                         // Keycode 1 = Escape in evdev
-                        if keycode == 1 && event.state() == KeyState::Pressed {
+                        if keycode == Keycode::new(1) && event.state() == KeyState::Pressed {
                             // Check if Super+Shift are held by checking keyboard modifiers
                             let shell = self.common.shell.read();
                             let seat = shell.seats.last_active().clone();
