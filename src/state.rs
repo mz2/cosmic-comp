@@ -126,7 +126,7 @@ use std::{
     collections::HashSet,
     ffi::OsString,
     process::Child,
-    sync::{Arc, LazyLock, Once, atomic::AtomicBool},
+    sync::{Arc, LazyLock, Mutex, Once, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 
@@ -297,6 +297,8 @@ pub struct Common {
     pub inhibit_lid_fd: Option<OwnedFd>,
 
     pub with_xwayland: bool,
+
+    pub input_capture_state: Option<Arc<Mutex<crate::dbus::input_capture::InputCaptureState>>>,
 }
 
 #[derive(Debug)]
@@ -728,9 +730,13 @@ impl State {
 
         let async_executor = ThreadPool::builder().pool_size(1).create().unwrap();
 
-        if let Err(err) = crate::dbus::init(&handle, &async_executor) {
-            tracing::warn!(?err, "Failed to initialize dbus handlers");
-        }
+        let input_capture_state = match crate::dbus::init(&handle, &async_executor) {
+            Ok((_tokens, ic_state)) => ic_state,
+            Err(err) => {
+                tracing::warn!(?err, "Failed to initialize dbus handlers");
+                None
+            }
+        };
 
         let a11y_state = A11yState::new::<State, _>(dh, client_not_sandboxed);
 
@@ -803,6 +809,8 @@ impl State {
                 inhibit_lid_fd: None,
 
                 with_xwayland,
+
+                input_capture_state,
             },
             backend: BackendData::Unset,
             ready: Once::new(),
@@ -909,6 +917,108 @@ impl State {
                     }
                 }
                 // drop _fd
+            }
+        }
+    }
+
+    pub fn handle_input_capture_event(
+        &mut self,
+        event: crate::dbus::input_capture::InputCaptureEvent,
+    ) {
+        use crate::dbus::input_capture::InputCaptureEvent;
+        match event {
+            InputCaptureEvent::SessionCreated {
+                session_id,
+                capabilities,
+            } => {
+                tracing::info!(
+                    session_id,
+                    capabilities,
+                    "Input capture session created"
+                );
+                // Update zones from current output layout
+                self.update_input_capture_zones();
+            }
+            InputCaptureEvent::SessionClosed { session_id } => {
+                tracing::info!(session_id, "Input capture session closed");
+            }
+            InputCaptureEvent::BarriersSet {
+                session_id,
+                barriers,
+                zone_set,
+            } => {
+                tracing::info!(
+                    session_id,
+                    barrier_count = barriers.len(),
+                    zone_set,
+                    "Input capture barriers set"
+                );
+            }
+            InputCaptureEvent::Enabled { session_id } => {
+                tracing::info!(session_id, "Input capture session enabled");
+            }
+            InputCaptureEvent::Disabled { session_id } => {
+                tracing::info!(session_id, "Input capture session disabled");
+            }
+            InputCaptureEvent::Released {
+                session_id,
+                activation_id,
+                cursor_position,
+            } => {
+                tracing::info!(
+                    session_id,
+                    activation_id,
+                    ?cursor_position,
+                    "Input capture session released"
+                );
+                // Warp cursor to the requested position
+                if let Some((x, y)) = cursor_position {
+                    let shell = self.common.shell.read();
+                    let seat = shell.seats.last_active().clone();
+                    if let Some(ptr) = seat.get_pointer() {
+                        let location = Point::from((x, y));
+                        std::mem::drop(shell);
+                        // TODO: Actually warp the cursor via pointer.motion()
+                        tracing::info!(?location, "Warping cursor after input capture release");
+                    }
+                }
+            }
+            InputCaptureEvent::ConnectEIS {
+                session_id,
+                server_fd,
+            } => {
+                tracing::info!(session_id, "EIS connection requested");
+                // TODO: Create reis::eis::Context from server_fd
+                // TODO: Create EIS seat with keyboard + pointer capabilities
+                // TODO: Register EIS event source with calloop
+                let _ = server_fd;
+            }
+        }
+    }
+
+    /// Update input capture zones from current output layout
+    pub fn update_input_capture_zones(&self) {
+        if let Some(ref ic_state) = self.common.input_capture_state {
+            let shell = self.common.shell.read();
+            let zones: Vec<crate::dbus::input_capture::Zone> = shell
+                .outputs()
+                .map(|output| {
+                    let geo = output.geometry();
+                    crate::dbus::input_capture::Zone {
+                        width: geo.size.w as u32,
+                        height: geo.size.h as u32,
+                        x: geo.loc.x,
+                        y: geo.loc.y,
+                    }
+                })
+                .collect();
+            if let Ok(mut state) = ic_state.lock() {
+                state.update_zones(zones);
+                tracing::debug!(
+                    zone_count = state.zones.len(),
+                    zone_set = state.zone_set,
+                    "Updated input capture zones"
+                );
             }
         }
     }

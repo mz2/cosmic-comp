@@ -8,10 +8,12 @@ use cosmic_comp_config::output::comp::OutputState;
 use futures_executor::{ThreadPool, block_on};
 use futures_util::stream::StreamExt;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tracing::{error, warn};
 use zbus::blocking::{Connection, fdo::DBusProxy};
 
 pub mod a11y_keyboard_monitor;
+pub mod input_capture;
 #[cfg(feature = "systemd")]
 pub mod logind;
 mod name_owners;
@@ -20,7 +22,10 @@ mod power;
 pub fn init(
     evlh: &LoopHandle<'static, State>,
     executor: &ThreadPool,
-) -> Result<Vec<RegistrationToken>> {
+) -> Result<(
+    Vec<RegistrationToken>,
+    Option<Arc<Mutex<input_capture::InputCaptureState>>>,
+)> {
     let mut tokens = Vec::new();
 
     match block_on(power::init()) {
@@ -80,7 +85,28 @@ pub fn init(
         }
     };
 
-    Ok(tokens)
+    // Initialize InputCapture D-Bus service
+    let input_capture_state = match input_capture::init(executor) {
+        Ok((rx, ic_state)) => {
+            let token = evlh
+                .insert_source(rx, |event, _, state| match event {
+                    calloop::channel::Event::Msg(ic_event) => {
+                        state.handle_input_capture_event(ic_event);
+                    }
+                    calloop::channel::Event::Closed => (),
+                })
+                .map_err(|InsertError { error, .. }| error)
+                .with_context(|| "Failed to add input capture channel to event_loop")?;
+            tokens.push(token);
+            Some(ic_state)
+        }
+        Err(err) => {
+            tracing::warn!(?err, "Failed to initialize InputCapture D-Bus service");
+            None
+        }
+    };
+
+    Ok((tokens, input_capture_state))
 }
 
 /// Updated the D-Bus activation environment with `WAYLAND_DISPLAY` and
