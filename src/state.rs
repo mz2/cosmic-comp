@@ -1145,7 +1145,7 @@ impl State {
         );
 
         // Store the EIS connection state in the session
-        if let Some(ref ic) = ic_state {
+        if let Some(ic) = ic_state {
             if let Ok(mut state) = ic.lock() {
                 if let Some(session) = state.sessions.get_mut(session_id) {
                     session.eis_connection = Some(crate::dbus::input_capture::EisConnection {
