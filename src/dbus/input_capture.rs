@@ -413,6 +413,7 @@ impl InputCaptureInterface {
         Ok(())
     }
 
+    #[zbus(name = "ConnectToEIS")]
     async fn connect_to_eis(&self, session_id: &str) -> zbus::fdo::Result<zbus::zvariant::OwnedFd> {
         let (client_stream, server_stream) = std::os::unix::net::UnixStream::pair()
             .map_err(|e| zbus::fdo::Error::Failed(format!("socketpair failed: {}", e)))?;
