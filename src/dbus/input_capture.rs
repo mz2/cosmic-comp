@@ -32,6 +32,38 @@ pub enum CaptureSessionState {
     Activated,
 }
 
+/// EIS connection state for a session (server-side).
+///
+/// All reis types (Connection, Seat, Device) use Arc internally and are Clone.
+/// They may not be Send/Sync in all configurations, so we wrap in a
+/// non-Send marker if needed. In practice, since the compositor is
+/// single-threaded on the calloop event loop, and we only access these
+/// from the event loop callbacks, this is safe.
+pub struct EisConnection {
+    pub connection: reis::request::Connection,
+    pub seat: reis::request::Seat,
+    pub pointer_device: reis::request::Device,
+    pub keyboard_device: reis::request::Device,
+    /// Sequence counter for start_emulating
+    pub sequence: u32,
+}
+
+impl std::fmt::Debug for EisConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EisConnection")
+            .field("sequence", &self.sequence)
+            .finish_non_exhaustive()
+    }
+}
+
+// SAFETY: EisConnection is only accessed from the compositor's calloop event loop thread.
+// The reis types use Arc<Mutex<...>> internally for their state, making them
+// structurally safe to send between threads, even though they don't explicitly
+// implement Send. We need Send+Sync because they're stored in InputCaptureState
+// which is behind Arc<Mutex<...>>.
+unsafe impl Send for EisConnection {}
+unsafe impl Sync for EisConnection {}
+
 /// Per-session capture data
 #[derive(Debug)]
 pub struct CaptureSession {
@@ -41,6 +73,28 @@ pub struct CaptureSession {
     pub zone_set: u32,
     pub activation_id: u32,
     pub eis_fd: Option<std::os::fd::OwnedFd>,
+    pub eis_connection: Option<EisConnection>,
+}
+
+/// D-Bus signal events sent from compositor to the D-Bus service thread
+#[derive(Debug)]
+pub enum SignalEvent {
+    Activated {
+        session_id: String,
+        barrier_id: u32,
+        activation_id: u32,
+        cursor_position: (f64, f64),
+    },
+    Deactivated {
+        session_id: String,
+        activation_id: u32,
+    },
+    Disabled {
+        session_id: String,
+    },
+    ZonesChanged {
+        zone_set: u32,
+    },
 }
 
 /// Messages from the D-Bus interface to the compositor event loop
@@ -76,7 +130,6 @@ pub enum InputCaptureEvent {
 }
 
 /// Shared state between D-Bus thread and compositor
-#[derive(Debug, Default)]
 pub struct InputCaptureState {
     pub sessions: HashMap<String, CaptureSession>,
     /// Currently active capture session (if any)
@@ -87,6 +140,34 @@ pub struct InputCaptureState {
     pub zones: Vec<Zone>,
     /// Next activation ID
     pub next_activation_id: u32,
+    /// Channel sender for D-Bus signal emission (compositor -> D-Bus thread)
+    pub signal_tx: Option<std::sync::mpsc::Sender<SignalEvent>>,
+}
+
+impl std::fmt::Debug for InputCaptureState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InputCaptureState")
+            .field("sessions", &self.sessions)
+            .field("active_session", &self.active_session)
+            .field("zone_set", &self.zone_set)
+            .field("zones", &self.zones)
+            .field("next_activation_id", &self.next_activation_id)
+            .field("signal_tx", &self.signal_tx.is_some())
+            .finish()
+    }
+}
+
+impl Default for InputCaptureState {
+    fn default() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            active_session: None,
+            zone_set: 0,
+            zones: Vec::new(),
+            next_activation_id: 0,
+            signal_tx: None,
+        }
+    }
 }
 
 impl InputCaptureState {
@@ -101,6 +182,17 @@ impl InputCaptureState {
     pub fn update_zones(&mut self, zones: Vec<Zone>) {
         self.zones = zones;
         self.zone_set += 1;
+    }
+
+    /// Send a signal event to the D-Bus thread for emission
+    pub fn emit_signal(&self, event: SignalEvent) {
+        if let Some(ref tx) = self.signal_tx {
+            if let Err(e) = tx.send(event) {
+                tracing::warn!("Failed to send signal event to D-Bus thread: {}", e);
+            }
+        } else {
+            tracing::warn!("No signal_tx configured, cannot emit D-Bus signal");
+        }
     }
 
     /// Check if cursor movement from `from` to `to` crosses any barrier in enabled sessions
@@ -194,6 +286,7 @@ impl InputCaptureInterface {
                     zone_set: current_zone_set,
                     activation_id: 0,
                     eis_fd: None,
+                    eis_connection: None,
                 },
             );
         }
@@ -431,8 +524,17 @@ pub fn init(
     let state = Arc::new(Mutex::new(InputCaptureState::new()));
     let state_clone = state.clone();
 
+    // Create a channel for compositor -> D-Bus signal emission
+    let (signal_tx, signal_rx) = std::sync::mpsc::channel::<SignalEvent>();
+
+    // Store the signal sender in the shared state
+    {
+        let mut s = state.lock().unwrap();
+        s.signal_tx = Some(signal_tx);
+    }
+
     executor.spawn_ok(async move {
-        match serve(state_clone, tx).await {
+        match serve(state_clone, tx, signal_rx).await {
             Ok(()) => {}
             Err(err) => {
                 tracing::error!(?err, "InputCapture D-Bus service failed");
@@ -446,6 +548,7 @@ pub fn init(
 async fn serve(
     state: Arc<Mutex<InputCaptureState>>,
     tx: channel::Sender<InputCaptureEvent>,
+    signal_rx: std::sync::mpsc::Receiver<SignalEvent>,
 ) -> anyhow::Result<()> {
     let connection = zbus::Connection::session().await?;
     let interface = InputCaptureInterface::new(state, tx);
@@ -458,6 +561,107 @@ async fn serve(
     connection.request_name("org.cosmic.InputCapture").await?;
 
     tracing::info!("InputCapture D-Bus service started");
+
+    // Spawn a blocking thread that receives signal events from the compositor
+    // and emits D-Bus signals. We use std::sync::mpsc::Receiver::recv() which
+    // blocks the thread, avoiding busy-waiting. The D-Bus connection is
+    // thread-safe and can be used from this background thread.
+    let conn = connection.clone();
+    std::thread::Builder::new()
+        .name("input-capture-signals".into())
+        .spawn(move || {
+            // Use a blocking runtime to emit signals
+            futures_executor::block_on(async move {
+                loop {
+                    // Block until a signal event arrives
+                    let event = match signal_rx.recv() {
+                        Ok(event) => event,
+                        Err(_) => {
+                            tracing::info!("Signal channel disconnected, stopping signal emission");
+                            break;
+                        }
+                    };
+
+                    let iface_ref = conn
+                        .object_server()
+                        .interface::<_, InputCaptureInterface>("/org/cosmic/InputCapture")
+                        .await;
+                    let iface_ref = match iface_ref {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to get interface ref for signal emission: {}",
+                                e
+                            );
+                            continue;
+                        }
+                    };
+                    let ctxt = iface_ref.signal_emitter();
+                    match event {
+                        SignalEvent::Activated {
+                            session_id,
+                            barrier_id,
+                            activation_id,
+                            cursor_position,
+                        } => {
+                            if let Err(e) = InputCaptureInterface::activated(
+                                &ctxt,
+                                &session_id,
+                                barrier_id,
+                                activation_id,
+                                cursor_position,
+                            )
+                            .await
+                            {
+                                tracing::warn!("Failed to emit Activated signal: {}", e);
+                            } else {
+                                tracing::info!(
+                                    session_id,
+                                    barrier_id,
+                                    activation_id,
+                                    "Emitted Activated D-Bus signal"
+                                );
+                            }
+                        }
+                        SignalEvent::Deactivated {
+                            session_id,
+                            activation_id,
+                        } => {
+                            if let Err(e) = InputCaptureInterface::deactivated(
+                                &ctxt,
+                                &session_id,
+                                activation_id,
+                            )
+                            .await
+                            {
+                                tracing::warn!("Failed to emit Deactivated signal: {}", e);
+                            } else {
+                                tracing::info!(
+                                    session_id,
+                                    activation_id,
+                                    "Emitted Deactivated D-Bus signal"
+                                );
+                            }
+                        }
+                        SignalEvent::Disabled { session_id } => {
+                            if let Err(e) =
+                                InputCaptureInterface::disabled_signal(&ctxt, &session_id).await
+                            {
+                                tracing::warn!("Failed to emit Disabled signal: {}", e);
+                            }
+                        }
+                        SignalEvent::ZonesChanged { zone_set } => {
+                            if let Err(e) =
+                                InputCaptureInterface::zones_changed(&ctxt, zone_set).await
+                            {
+                                tracing::warn!("Failed to emit ZonesChanged signal: {}", e);
+                            }
+                        }
+                    }
+                }
+            });
+        })
+        .expect("Failed to spawn signal emission thread");
 
     // Keep the connection alive
     std::future::pending::<()>().await;

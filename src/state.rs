@@ -931,11 +931,7 @@ impl State {
                 session_id,
                 capabilities,
             } => {
-                tracing::info!(
-                    session_id,
-                    capabilities,
-                    "Input capture session created"
-                );
+                tracing::info!(session_id, capabilities, "Input capture session created");
                 // Update zones from current output layout
                 self.update_input_capture_zones();
             }
@@ -971,6 +967,26 @@ impl State {
                     ?cursor_position,
                     "Input capture session released"
                 );
+
+                // Pause EIS devices and emit Deactivated signal
+                if let Some(ref ic_state) = self.common.input_capture_state {
+                    if let Ok(mut state) = ic_state.lock() {
+                        if let Some(session) = state.sessions.get_mut(&session_id) {
+                            if let Some(ref eis) = session.eis_connection {
+                                eis.pointer_device.stop_emulating();
+                                eis.keyboard_device.stop_emulating();
+                                eis.pointer_device.paused();
+                                eis.keyboard_device.paused();
+                                let _ = eis.connection.flush();
+                            }
+                        }
+                        state.emit_signal(crate::dbus::input_capture::SignalEvent::Deactivated {
+                            session_id: session_id.clone(),
+                            activation_id,
+                        });
+                    }
+                }
+
                 // Warp cursor to the requested position
                 if let Some((x, y)) = cursor_position {
                     let shell = self.common.shell.read();
@@ -987,10 +1003,159 @@ impl State {
                 server_fd,
             } => {
                 tracing::info!(session_id, "EIS connection requested");
-                // TODO: Create reis::eis::Context from server_fd
-                // TODO: Create EIS seat with keyboard + pointer capabilities
-                // TODO: Register EIS event source with calloop
-                let _ = server_fd;
+
+                // Convert OwnedFd to UnixStream for reis
+                let server_stream: std::os::unix::net::UnixStream = server_fd.into();
+
+                match reis::eis::Context::new(server_stream) {
+                    Ok(context) => {
+                        // Create a calloop event source for the EIS context to handle client
+                        // handshake and requests. We use the EisRequestSource which handles
+                        // the handshake automatically.
+                        let eis_source = reis::calloop::EisRequestSource::new(context.clone(), 1);
+
+                        let ic_state = self.common.input_capture_state.clone();
+                        let eis_session_id = session_id.clone();
+
+                        match self.common.event_loop_handle.insert_source(
+                            eis_source,
+                            move |event, connection, _state| {
+                                match event {
+                                    Ok(reis::calloop::EisRequestSourceEvent::Connected) => {
+                                        tracing::info!(
+                                            session_id = %eis_session_id,
+                                            "EIS client connected, setting up seat and devices"
+                                        );
+                                        // Now that handshake is complete, create seat and devices
+                                        Self::setup_eis_devices(
+                                            &ic_state,
+                                            &eis_session_id,
+                                            connection,
+                                        );
+                                    }
+                                    Ok(reis::calloop::EisRequestSourceEvent::Request(
+                                        reis::request::EisRequest::Bind(bind),
+                                    )) => {
+                                        tracing::info!(
+                                            session_id = %eis_session_id,
+                                            ?bind.capabilities,
+                                            "EIS client bound seat capabilities"
+                                        );
+                                    }
+                                    Ok(reis::calloop::EisRequestSourceEvent::Request(
+                                        reis::request::EisRequest::Disconnect,
+                                    )) => {
+                                        tracing::info!(
+                                            session_id = %eis_session_id,
+                                            "EIS client disconnected"
+                                        );
+                                        if let Some(ref ic) = ic_state {
+                                            if let Ok(mut state) = ic.lock() {
+                                                if let Some(session) =
+                                                    state.sessions.get_mut(&eis_session_id)
+                                                {
+                                                    session.eis_connection = None;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Ok(reis::calloop::EisRequestSourceEvent::Request(req)) => {
+                                        tracing::debug!(
+                                            session_id = %eis_session_id,
+                                            ?req,
+                                            "EIS request (ignored, we are the sender)"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            session_id = %eis_session_id,
+                                            "EIS error: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                                Ok(calloop::PostAction::Continue)
+                            },
+                        ) {
+                            Ok(_token) => {
+                                tracing::info!(
+                                    session_id,
+                                    "EIS event source registered with calloop"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    session_id,
+                                    "Failed to register EIS event source: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(session_id, "Failed to create EIS context from fd: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Set up EIS seat and devices after handshake completes.
+    /// Called from the calloop EIS event source callback.
+    fn setup_eis_devices(
+        ic_state: &Option<Arc<Mutex<crate::dbus::input_capture::InputCaptureState>>>,
+        session_id: &str,
+        connection: &mut reis::request::Connection,
+    ) {
+        use reis::request::DeviceCapability;
+
+        let seat_capabilities = DeviceCapability::Pointer
+            | DeviceCapability::Keyboard
+            | DeviceCapability::Button
+            | DeviceCapability::Scroll;
+
+        let seat = connection.add_seat(Some("default"), seat_capabilities);
+
+        // Add pointer device with pointer, button, and scroll capabilities
+        let pointer_capabilities =
+            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll;
+        let pointer_device = seat.add_device(
+            Some("pointer"),
+            reis::eis::device::DeviceType::Virtual,
+            pointer_capabilities,
+            |_device| {},
+        );
+
+        // Add keyboard device
+        let keyboard_device = seat.add_device(
+            Some("keyboard"),
+            reis::eis::device::DeviceType::Virtual,
+            DeviceCapability::Keyboard.into(),
+            |_device| {},
+        );
+
+        if let Err(e) = connection.flush() {
+            tracing::error!("Failed to flush EIS connection after setup: {}", e);
+            return;
+        }
+
+        tracing::info!(
+            session_id,
+            "EIS seat and devices created (pointer + keyboard)"
+        );
+
+        // Store the EIS connection state in the session
+        if let Some(ref ic) = ic_state {
+            if let Ok(mut state) = ic.lock() {
+                if let Some(session) = state.sessions.get_mut(session_id) {
+                    session.eis_connection = Some(crate::dbus::input_capture::EisConnection {
+                        connection: connection.clone(),
+                        seat,
+                        pointer_device,
+                        keyboard_device,
+                        sequence: 0,
+                    });
+                }
             }
         }
     }

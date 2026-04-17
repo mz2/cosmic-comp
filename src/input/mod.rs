@@ -170,7 +170,10 @@ impl State {
         // to the EIS connection instead of processing them normally.
         // The force-disable shortcut (Super+Shift+Escape) is always checked first.
         {
-            let capture_active = self.common.input_capture_state.as_ref()
+            let capture_active = self
+                .common
+                .input_capture_state
+                .as_ref()
                 .and_then(|ic| ic.lock().ok())
                 .as_ref()
                 .and_then(|state| state.active_session.clone());
@@ -197,18 +200,46 @@ impl State {
                     tracing::warn!("Force-disabling input capture (Super+Shift+Escape)");
                     if let Some(ref ic_state) = self.common.input_capture_state {
                         if let Ok(mut state) = ic_state.lock() {
+                            let activation_id = state
+                                .sessions
+                                .get(&active_session_id)
+                                .map(|s| s.activation_id)
+                                .unwrap_or(0);
                             if let Some(session) = state.sessions.get_mut(&active_session_id) {
-                                session.state = crate::dbus::input_capture::CaptureSessionState::Disabled;
+                                // Stop emulating and pause EIS devices
+                                if let Some(ref eis) = session.eis_connection {
+                                    eis.pointer_device.stop_emulating();
+                                    eis.keyboard_device.stop_emulating();
+                                    eis.pointer_device.paused();
+                                    eis.keyboard_device.paused();
+                                    let _ = eis.connection.flush();
+                                }
+                                session.state =
+                                    crate::dbus::input_capture::CaptureSessionState::Disabled;
                             }
                             state.active_session = None;
+                            // Emit Deactivated signal
+                            state.emit_signal(
+                                crate::dbus::input_capture::SignalEvent::Deactivated {
+                                    session_id: active_session_id.clone(),
+                                    activation_id,
+                                },
+                            );
                         }
                     }
                     return;
                 }
 
-                // During active capture, all input events go to EIS
-                // TODO: Forward events to EIS connection
-                trace!("Input capture active, redirecting input event to EIS");
+                // During active capture, forward input events to EIS
+                if let Some(ref ic_state) = self.common.input_capture_state {
+                    if let Ok(state) = ic_state.lock() {
+                        if let Some(session) = state.sessions.get(&active_session_id) {
+                            if let Some(ref eis) = session.eis_connection {
+                                Self::forward_input_to_eis(&event, eis);
+                            }
+                        }
+                    }
+                }
                 return;
             }
         }
@@ -400,40 +431,63 @@ impl State {
                     // Check for input capture barrier crossing.
                     // We must fully release the borrow on self.common before calling
                     // ptr.motion/frame which need &mut self.
-                    let barrier_crossed = self.common.input_capture_state.as_ref().and_then(|ic_state| {
-                        let mut state = ic_state.lock().ok()?;
-                        if state.active_session.is_some() {
-                            return None;
-                        }
-                        let from = (original_position.x, original_position.y);
-                        let to = (position.x, position.y);
-                        let (barrier_id, session_id, intersection) =
-                            state.check_barrier_crossing(from, to)?;
+                    let barrier_crossed =
+                        self.common
+                            .input_capture_state
+                            .as_ref()
+                            .and_then(|ic_state| {
+                                let mut state = ic_state.lock().ok()?;
+                                if state.active_session.is_some() {
+                                    return None;
+                                }
+                                let from = (original_position.x, original_position.y);
+                                let to = (position.x, position.y);
+                                let (barrier_id, session_id, intersection) =
+                                    state.check_barrier_crossing(from, to)?;
 
-                        // Activate the capture session
-                        state.next_activation_id += 1;
-                        let activation_id = state.next_activation_id;
-                        if let Some(session) = state.sessions.get_mut(&session_id) {
-                            session.state = crate::dbus::input_capture::CaptureSessionState::Activated;
-                            session.activation_id = activation_id;
-                        }
-                        state.active_session = Some(session_id.clone());
-                        tracing::info!(
-                            barrier_id,
-                            %session_id,
-                            activation_id,
-                            ?intersection,
-                            "Input capture barrier crossed, activating"
-                        );
-                        Some(intersection)
-                    });
+                                // Activate the capture session
+                                state.next_activation_id += 1;
+                                let activation_id = state.next_activation_id;
+                                if let Some(session) = state.sessions.get_mut(&session_id) {
+                                    session.state =
+                                        crate::dbus::input_capture::CaptureSessionState::Activated;
+                                    session.activation_id = activation_id;
+
+                                    // Resume EIS devices and start emulating
+                                    if let Some(ref mut eis) = session.eis_connection {
+                                        eis.sequence += 1;
+                                        eis.pointer_device.resumed();
+                                        eis.keyboard_device.resumed();
+                                        eis.pointer_device.start_emulating(eis.sequence);
+                                        eis.keyboard_device.start_emulating(eis.sequence);
+                                        let _ = eis.connection.flush();
+                                    }
+                                }
+                                state.active_session = Some(session_id.clone());
+
+                                // Emit Activated D-Bus signal
+                                state.emit_signal(
+                                    crate::dbus::input_capture::SignalEvent::Activated {
+                                        session_id: session_id.clone(),
+                                        barrier_id,
+                                        activation_id,
+                                        cursor_position: intersection,
+                                    },
+                                );
+
+                                tracing::info!(
+                                    barrier_id,
+                                    %session_id,
+                                    activation_id,
+                                    ?intersection,
+                                    "Input capture barrier crossed, activating"
+                                );
+                                Some(intersection)
+                            });
                     if let Some(intersection) = barrier_crossed {
                         // Clamp cursor to the barrier intersection point
                         position.x = intersection.0;
                         position.y = intersection.1;
-
-                        // TODO: Emit Activated signal on the D-Bus interface
-                        // TODO: Start forwarding input events to EIS
 
                         // Don't process further - cursor stays at barrier
                         std::mem::drop(shell);
@@ -1657,6 +1711,96 @@ impl State {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Forward an input event to the EIS connection for the active capture session.
+    fn forward_input_to_eis<B: InputBackend>(
+        event: &InputEvent<B>,
+        eis: &crate::dbus::input_capture::EisConnection,
+    ) where
+        <B as InputBackend>::Device: 'static,
+    {
+        use smithay::backend::input::Event;
+
+        // Get time in microseconds for EIS frame events
+        let time_us = match event {
+            InputEvent::Keyboard { event, .. } => Event::time_msec(event) as u64 * 1000,
+            InputEvent::PointerMotion { event, .. } => Event::time_msec(event) as u64 * 1000,
+            InputEvent::PointerMotionAbsolute { event, .. } => {
+                Event::time_msec(event) as u64 * 1000
+            }
+            InputEvent::PointerButton { event, .. } => Event::time_msec(event) as u64 * 1000,
+            InputEvent::PointerAxis { event, .. } => Event::time_msec(event) as u64 * 1000,
+            _ => 0,
+        };
+
+        match event {
+            InputEvent::PointerMotion { event, .. } => {
+                use smithay::backend::input::PointerMotionEvent;
+                let delta = event.delta();
+                if let Some(pointer) = eis.pointer_device.interface::<reis::eis::Pointer>() {
+                    pointer.motion_relative(delta.x as f32, delta.y as f32);
+                    eis.pointer_device.frame(time_us);
+                    let _ = eis.connection.flush();
+                    trace!(
+                        dx = delta.x,
+                        dy = delta.y,
+                        "Forwarded pointer motion to EIS"
+                    );
+                }
+            }
+            InputEvent::Keyboard { event, .. } => {
+                use smithay::backend::input::KeyboardKeyEvent;
+                let keycode = event.key_code();
+                let state = event.state();
+                if let Some(keyboard) = eis.keyboard_device.interface::<reis::eis::Keyboard>() {
+                    let eis_state = match state {
+                        KeyState::Pressed => reis::eis::keyboard::KeyState::Press,
+                        KeyState::Released => reis::eis::keyboard::KeyState::Released,
+                    };
+                    keyboard.key(keycode.raw(), eis_state);
+                    eis.keyboard_device.frame(time_us);
+                    let _ = eis.connection.flush();
+                    trace!(?keycode, ?state, "Forwarded keyboard event to EIS");
+                }
+            }
+            InputEvent::PointerButton { event, .. } => {
+                use smithay::backend::input::PointerButtonEvent;
+                if let Some(button_iface) = eis.pointer_device.interface::<reis::eis::Button>() {
+                    let eis_state = match event.state() {
+                        smithay::backend::input::ButtonState::Pressed => {
+                            reis::eis::button::ButtonState::Press
+                        }
+                        smithay::backend::input::ButtonState::Released => {
+                            reis::eis::button::ButtonState::Released
+                        }
+                    };
+                    button_iface.button(event.button_code(), eis_state);
+                    eis.pointer_device.frame(time_us);
+                    let _ = eis.connection.flush();
+                    trace!(
+                        button = event.button_code(),
+                        "Forwarded button event to EIS"
+                    );
+                }
+            }
+            InputEvent::PointerAxis { event, .. } => {
+                if let Some(scroll) = eis.pointer_device.interface::<reis::eis::Scroll>() {
+                    let h = event.amount(Axis::Horizontal).unwrap_or(0.0) as f32;
+                    let v = event.amount(Axis::Vertical).unwrap_or(0.0) as f32;
+                    if h != 0.0 || v != 0.0 {
+                        scroll.scroll(h, v);
+                        eis.pointer_device.frame(time_us);
+                        let _ = eis.connection.flush();
+                        trace!(h, v, "Forwarded scroll event to EIS");
+                    }
+                }
+            }
+            _ => {
+                // Other events (touch, tablet, etc.) are not forwarded
+                trace!("Input event type not forwarded to EIS");
             }
         }
     }
