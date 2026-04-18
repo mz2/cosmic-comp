@@ -499,6 +499,20 @@ impl State {
                                 let (barrier_id, session_id, intersection) =
                                     state.check_barrier_crossing(from, to)?;
 
+                                // Only activate if the session has an EIS connection ready.
+                                // Without EIS, input would be dropped with no way to recover.
+                                let session = state.sessions.get_mut(&session_id);
+                                let has_eis = session.as_ref()
+                                    .map(|s| s.eis_connection.is_some())
+                                    .unwrap_or(false);
+                                if !has_eis {
+                                    tracing::warn!(
+                                        %session_id,
+                                        "Barrier crossed but no EIS connection — not activating"
+                                    );
+                                    return None;
+                                }
+
                                 // Activate the capture session
                                 state.next_activation_id += 1;
                                 let activation_id = state.next_activation_id;
