@@ -442,6 +442,18 @@ impl State {
                                 }
                                 let from = (original_position.x, original_position.y);
                                 let to = (position.x, position.y);
+                                // Check if any sessions have barriers
+                                let has_enabled = state.sessions.values().any(|s| s.state == crate::dbus::input_capture::CaptureSessionState::Enabled && !s.barriers.is_empty());
+                                if has_enabled && (to.0 < 1.0 || to.1 < 1.0) {
+                                    tracing::info!(
+                                        from_x = from.0,
+                                        from_y = from.1,
+                                        to_x = to.0,
+                                        to_y = to.1,
+                                        sessions = state.sessions.len(),
+                                        "Barrier check: cursor near edge"
+                                    );
+                                }
                                 let (barrier_id, session_id, intersection) =
                                     state.check_barrier_crossing(from, to)?;
 
