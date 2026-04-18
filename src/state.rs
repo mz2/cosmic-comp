@@ -994,34 +994,24 @@ impl State {
                     }
                 }
                 if let Some((x, y)) = cursor_position {
+                    use smithay::utils::{Logical, SERIAL_COUNTER};
                     let shell = self.common.shell.read();
                     let seat = shell.seats.last_active().clone();
+                    std::mem::drop(shell);
                     if let Some(ptr) = seat.get_pointer() {
-                        let output = shell
-                            .outputs()
-                            .find(|o| o.geometry().to_f64().contains(Point::from((x, y))))
-                            .cloned()
-                            .or_else(|| shell.outputs().next().cloned());
-                        std::mem::drop(shell);
-                        if let Some(output) = output {
-                            let under = Self::surface_under(
-                                Point::from((x, y)),
-                                &output,
-                                &self.common.shell.read(),
-                            ).map(|(target, pos)| (target, pos.as_logical()));
-                            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-                            ptr.motion(
-                                self,
-                                under,
-                                &smithay::input::pointer::MotionEvent {
-                                    location: Point::<f64, smithay::utils::Logical>::from((x, y)),
-                                    serial,
-                                    time: 0,
-                                },
-                            );
-                            ptr.frame(self);
-                            tracing::info!(x, y, "Warped cursor after input capture release");
-                        }
+                        let location = Point::<f64, Logical>::from((x, y));
+                        let serial = SERIAL_COUNTER.next_serial();
+                        ptr.motion(
+                            self,
+                            None,
+                            &smithay::input::pointer::MotionEvent {
+                                location,
+                                serial,
+                                time: 0,
+                            },
+                        );
+                        ptr.frame(self);
+                        tracing::info!(x, y, "Warped cursor after input capture release");
                     }
                 }
             }
