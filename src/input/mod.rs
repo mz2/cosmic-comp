@@ -166,6 +166,15 @@ impl State {
     {
         crate::wayland::handlers::output_power::set_all_surfaces_dpms_on(self);
 
+        // One-time diagnostic: log input_capture_state status
+        {
+            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let has_state = self.common.input_capture_state.is_some();
+                tracing::info!(has_state, "InputCapture: input_capture_state initialized");
+            }
+        }
+
         // Check if input capture is active - if so, redirect most input events
         // to the EIS connection instead of processing them normally.
         // The force-disable shortcut (Super+Shift+Escape) is always checked first.
@@ -442,16 +451,29 @@ impl State {
                                 }
                                 let from = (original_position.x, original_position.y);
                                 let to = (position.x, position.y);
-                                // Check if any sessions have barriers
-                                let has_enabled = state.sessions.values().any(|s| s.state == crate::dbus::input_capture::CaptureSessionState::Enabled && !s.barriers.is_empty());
-                                if has_enabled && (to.0 < 1.0 || to.1 < 1.0) {
+
+                                // Diagnostic: log barrier state periodically when near edges
+                                let near_edge = to.0 < 5.0 || to.1 < 5.0
+                                    || to.0 > 3435.0 || to.1 > 1435.0;
+                                if near_edge {
+                                    let session_count = state.sessions.len();
+                                    let enabled_sessions: Vec<_> = state.sessions.iter()
+                                        .filter(|(_, s)| s.state == crate::dbus::input_capture::CaptureSessionState::Enabled)
+                                        .map(|(id, s)| format!("{}({} barriers)", id, s.barriers.len()))
+                                        .collect();
+                                    let all_barriers: Vec<_> = state.sessions.values()
+                                        .flat_map(|s| s.barriers.iter())
+                                        .map(|b| format!("id={} ({},{})→({},{})", b.id, b.x1, b.y1, b.x2, b.y2))
+                                        .collect();
                                     tracing::info!(
                                         from_x = from.0,
                                         from_y = from.1,
                                         to_x = to.0,
                                         to_y = to.1,
-                                        sessions = state.sessions.len(),
-                                        "Barrier check: cursor near edge"
+                                        session_count,
+                                        ?enabled_sessions,
+                                        ?all_barriers,
+                                        "InputCapture: cursor near edge, checking barriers"
                                     );
                                 }
                                 let (barrier_id, session_id, intersection) =

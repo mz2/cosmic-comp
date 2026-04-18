@@ -356,6 +356,14 @@ impl InputCaptureInterface {
         session.barriers = valid_barriers.clone();
         session.zone_set = zone_set;
 
+        tracing::info!(
+            session_id,
+            barrier_count = valid_barriers.len(),
+            failed_count = failed.len(),
+            barriers = ?valid_barriers.iter().map(|b| format!("({},{})→({},{})", b.x1, b.y1, b.x2, b.y2)).collect::<Vec<_>>(),
+            "D-Bus SetBarriers: stored barriers in shared state"
+        );
+
         drop(state);
 
         let _ = self.tx.send(InputCaptureEvent::BarriersSet {
@@ -377,6 +385,12 @@ impl InputCaptureInterface {
         match session.state {
             CaptureSessionState::Created | CaptureSessionState::Disabled => {
                 session.state = CaptureSessionState::Enabled;
+                tracing::info!(
+                    session_id,
+                    barrier_count = session.barriers.len(),
+                    has_eis = session.eis_connection.is_some(),
+                    "D-Bus Enable: session now Enabled"
+                );
             }
             _ => {
                 return Err(zbus::fdo::Error::Failed(format!(
