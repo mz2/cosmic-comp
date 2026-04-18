@@ -1109,6 +1109,13 @@ impl State {
     ) {
         use reis::request::DeviceCapability;
 
+        // Get output zones for setting device regions
+        let zones: Vec<crate::dbus::input_capture::Zone> = ic_state
+            .as_ref()
+            .and_then(|ic| ic.lock().ok())
+            .map(|state| state.zones.clone())
+            .unwrap_or_default();
+
         let seat_capabilities = DeviceCapability::Pointer
             | DeviceCapability::Keyboard
             | DeviceCapability::Button
@@ -1117,13 +1124,37 @@ impl State {
         let seat = connection.add_seat(Some("default"), seat_capabilities);
 
         // Add pointer device with pointer, button, and scroll capabilities
+        // Set regions so the EIS client knows the screen geometry
         let pointer_capabilities =
             DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll;
+        let zones_for_cb = zones.clone();
         let pointer_device = seat.add_device(
             Some("pointer"),
             reis::eis::device::DeviceType::Virtual,
             pointer_capabilities,
-            |_device| {},
+            move |device| {
+                // Set regions on the device matching the output layout
+                let eis_device = device.device();
+                if zones_for_cb.is_empty() {
+                    // Fallback: single 1920x1080 region
+                    eis_device.region(0, 0, 1920, 1080, 1.0);
+                    tracing::info!("EIS pointer: fallback region 1920x1080@0,0");
+                } else {
+                    for zone in &zones_for_cb {
+                        eis_device.region(
+                            zone.x as u32,
+                            zone.y as u32,
+                            zone.width,
+                            zone.height,
+                            1.0,
+                        );
+                        tracing::info!(
+                            "EIS pointer: region {}x{}@{},{}",
+                            zone.width, zone.height, zone.x, zone.y
+                        );
+                    }
+                }
+            },
         );
 
         // Add keyboard device
