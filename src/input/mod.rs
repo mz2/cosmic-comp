@@ -239,17 +239,37 @@ impl State {
                     return;
                 }
 
-                // During active capture, forward input events to EIS
+                // During active capture, forward input events to EIS.
+                // If the session is gone or EIS is disconnected, release capture
+                // to prevent stuck input.
+                let mut should_release = false;
                 if let Some(ref ic_state) = self.common.input_capture_state {
                     if let Ok(state) = ic_state.lock() {
                         if let Some(session) = state.sessions.get(&active_session_id) {
                             if let Some(ref eis) = session.eis_connection {
                                 Self::forward_input_to_eis(&event, eis);
+                            } else {
+                                // EIS connection gone — release
+                                tracing::warn!("Input capture: EIS connection gone, releasing");
+                                should_release = true;
                             }
+                        } else {
+                            // Session gone — release
+                            tracing::warn!("Input capture: session gone, releasing");
+                            should_release = true;
                         }
                     }
                 }
-                return;
+                if should_release {
+                    if let Some(ref ic_state) = self.common.input_capture_state {
+                        if let Ok(mut state) = ic_state.lock() {
+                            state.active_session = None;
+                        }
+                    }
+                    // Don't return — process this event normally
+                } else {
+                    return;
+                }
             }
         }
 

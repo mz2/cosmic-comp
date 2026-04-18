@@ -1062,15 +1062,21 @@ impl State {
                                     Ok(reis::calloop::EisRequestSourceEvent::Request(
                                         reis::request::EisRequest::Disconnect,
                                     )) => {
-                                        tracing::info!(
+                                        tracing::warn!(
                                             session_id = %eis_session_id,
-                                            "EIS client disconnected"
+                                            "EIS client disconnected — releasing input capture"
                                         );
                                         if let Some(ref ic) = ic_state {
                                             if let Ok(mut state) = ic.lock() {
+                                                // Clear active session to restore normal input
+                                                if state.active_session.as_deref() == Some(&eis_session_id) {
+                                                    state.active_session = None;
+                                                    tracing::warn!("Cleared active input capture session");
+                                                }
                                                 if let Some(session) =
                                                     state.sessions.get_mut(&eis_session_id)
                                                 {
+                                                    session.state = crate::dbus::input_capture::CaptureSessionState::Disabled;
                                                     session.eis_connection = None;
                                                 }
                                             }
@@ -1086,9 +1092,18 @@ impl State {
                                     Err(e) => {
                                         tracing::warn!(
                                             session_id = %eis_session_id,
-                                            "EIS error: {}",
+                                            "EIS error: {} — releasing input capture",
                                             e
                                         );
+                                        // EIS socket error — release capture to prevent stuck input
+                                        if let Some(ref ic) = ic_state {
+                                            if let Ok(mut state) = ic.lock() {
+                                                if state.active_session.as_deref() == Some(&eis_session_id) {
+                                                    state.active_session = None;
+                                                    tracing::warn!("Cleared active input capture session on EIS error");
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 Ok(calloop::PostAction::Continue)
