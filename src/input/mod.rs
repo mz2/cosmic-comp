@@ -171,7 +171,7 @@ impl State {
             static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 let has_state = self.common.input_capture_state.is_some();
-                tracing::info!(has_state, "InputCapture: input_capture_state initialized");
+                tracing::warn!(has_state, "InputCapture: input_capture_state initialized");
             }
         }
 
@@ -465,7 +465,7 @@ impl State {
                                         .flat_map(|s| s.barriers.iter())
                                         .map(|b| format!("id={} ({},{})→({},{})", b.id, b.x1, b.y1, b.x2, b.y2))
                                         .collect();
-                                    tracing::info!(
+                                    tracing::warn!(
                                         from_x = from.0,
                                         from_y = from.1,
                                         to_x = to.0,
