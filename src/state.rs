@@ -987,14 +987,41 @@ impl State {
                     }
                 }
 
-                // Warp cursor to the requested position
+                // Warp cursor to the requested position and clear active session
+                if let Some(ref ic_state) = self.common.input_capture_state {
+                    if let Ok(mut state) = ic_state.lock() {
+                        state.active_session = None;
+                    }
+                }
                 if let Some((x, y)) = cursor_position {
                     let shell = self.common.shell.read();
                     let seat = shell.seats.last_active().clone();
-                    if let Some(_ptr) = seat.get_pointer() {
+                    if let Some(ptr) = seat.get_pointer() {
+                        let output = shell
+                            .outputs()
+                            .find(|o| o.geometry().to_f64().contains(Point::from((x, y))))
+                            .cloned()
+                            .or_else(|| shell.outputs().next().cloned());
                         std::mem::drop(shell);
-                        // TODO: Actually warp the cursor via pointer.motion()
-                        tracing::info!(x, y, "Warping cursor after input capture release");
+                        if let Some(output) = output {
+                            let under = Self::surface_under(
+                                Point::from((x, y)),
+                                &output,
+                                &self.common.shell.read(),
+                            ).map(|(target, pos)| (target, pos.as_logical()));
+                            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                            ptr.motion(
+                                self,
+                                under,
+                                &smithay::input::pointer::MotionEvent {
+                                    location: Point::<f64, smithay::utils::Logical>::from((x, y)),
+                                    serial,
+                                    time: 0,
+                                },
+                            );
+                            ptr.frame(self);
+                            tracing::info!(x, y, "Warped cursor after input capture release");
+                        }
                     }
                 }
             }
