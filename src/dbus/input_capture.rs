@@ -276,6 +276,30 @@ impl InputCaptureInterface {
 
         {
             let mut state = self.state.lock().unwrap();
+
+            // Clean up stale sessions: remove any that have no EIS connection
+            // or are in Disabled/Created state with no barriers.
+            // This prevents stale sessions from interfering with barrier detection.
+            let stale: Vec<String> = state
+                .sessions
+                .iter()
+                .filter(|(_, s)| {
+                    s.eis_connection.is_none()
+                        || (s.state == CaptureSessionState::Disabled
+                            && s.barriers.is_empty())
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &stale {
+                tracing::info!(session_id = %id, "Removing stale input capture session");
+                if state.active_session.as_deref() == Some(id.as_str()) {
+                    state.active_session = None;
+                }
+            }
+            for id in stale {
+                state.sessions.remove(&id);
+            }
+
             let current_zone_set = state.zone_set;
             state.sessions.insert(
                 session_id.clone(),

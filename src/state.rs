@@ -1073,12 +1073,13 @@ impl State {
                                                     state.active_session = None;
                                                     tracing::warn!("Cleared active input capture session");
                                                 }
-                                                if let Some(session) =
-                                                    state.sessions.get_mut(&eis_session_id)
-                                                {
-                                                    session.state = crate::dbus::input_capture::CaptureSessionState::Disabled;
-                                                    session.eis_connection = None;
-                                                }
+                                                // Remove the entire session — it's dead
+                                                state.sessions.remove(&eis_session_id);
+                                                tracing::warn!(
+                                                    session_id = %eis_session_id,
+                                                    remaining = state.sessions.len(),
+                                                    "Removed disconnected session"
+                                                );
                                             }
                                         }
                                     }
