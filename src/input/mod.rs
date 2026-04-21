@@ -1811,12 +1811,20 @@ impl State {
                 if let Some(pointer) = eis.pointer_device.interface::<reis::eis::Pointer>() {
                     pointer.motion_relative(delta.x as f32, delta.y as f32);
                     eis.pointer_device.frame(time_us);
-                    let _ = eis.connection.flush();
-                    trace!(
-                        dx = delta.x,
-                        dy = delta.y,
-                        "Forwarded pointer motion to EIS"
-                    );
+                    match eis.connection.flush() {
+                        Ok(_) => {
+                            // Log first few events at warn level for debugging
+                            static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                            let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if n < 5 {
+                                tracing::warn!(dx = delta.x, dy = delta.y, "EIS: forwarded pointer motion #{}", n);
+                            }
+                        }
+                        Err(e) => tracing::warn!("EIS flush failed: {}", e),
+                    }
+                } else {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| tracing::warn!("EIS: no Pointer interface on device"));
                 }
             }
             InputEvent::Keyboard { event, .. } => {
