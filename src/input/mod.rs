@@ -248,6 +248,16 @@ impl State {
                         if let Some(session) = state.sessions.get(&active_session_id) {
                             if let Some(ref eis) = session.eis_connection {
                                 Self::forward_input_to_eis(&event, eis);
+                                static REDIR_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                                let n = REDIR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if n < 3 {
+                                    tracing::warn!(
+                                        %active_session_id,
+                                        session_state = ?session.state,
+                                        "Input capture: redirected event #{} to EIS",
+                                        n
+                                    );
+                                }
                             } else {
                                 // EIS connection gone — release
                                 tracing::warn!("Input capture: EIS connection gone, releasing");
