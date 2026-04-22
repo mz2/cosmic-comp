@@ -192,7 +192,8 @@ impl State {
                 let is_escape_shortcut = if let InputEvent::Keyboard { ref event, .. } = event {
                     use smithay::backend::input::KeyboardKeyEvent;
                     let keycode = event.key_code();
-                    if keycode == Keycode::new(1) && event.state() == KeyState::Pressed {
+                    // Escape key: evdev=1, xkb=9 (smithay returns xkb keycodes)
+                    if keycode == Keycode::new(9) && event.state() == KeyState::Pressed {
                         let shell = self.common.shell.read();
                         let seat = shell.seats.last_active().clone();
                         let keyboard = seat.get_keyboard().unwrap();
@@ -1856,7 +1857,10 @@ impl State {
                         KeyState::Pressed => reis::eis::keyboard::KeyState::Press,
                         KeyState::Released => reis::eis::keyboard::KeyState::Released,
                     };
-                    keyboard.key(keycode.raw(), eis_state);
+                    // Convert XKB keycode (smithay) to evdev keycode (EIS protocol).
+                    // smithay's key_code() returns evdev + 8.
+                    let evdev_keycode = keycode.raw().saturating_sub(8);
+                    keyboard.key(evdev_keycode, eis_state);
                     eis.keyboard_device.frame(time_us);
                     if eis.connection.flush().is_err() { return false; }
                     trace!(?keycode, ?state, "Forwarded keyboard event to EIS");
