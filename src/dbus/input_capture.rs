@@ -491,11 +491,11 @@ impl InputCaptureInterface {
         // switch.
         if let Some(activated_at) = session.activated_at {
             let elapsed = activated_at.elapsed();
-            if elapsed < std::time::Duration::from_millis(500) {
+            if elapsed < std::time::Duration::from_millis(50) {
                 tracing::warn!(
                     session_id,
                     elapsed_ms = elapsed.as_millis() as u64,
-                    "Ignoring premature Release ({}ms since activation, need 500ms)",
+                    "Ignoring premature Release ({}ms since activation, need 50ms)",
                     elapsed.as_millis()
                 );
                 drop(state);
