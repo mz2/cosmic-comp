@@ -503,7 +503,9 @@ impl InputCaptureInterface {
             }
         }
 
-        session.state = CaptureSessionState::Disabled;
+        // After Release, go back to Enabled (barriers stay armed for the
+        // next crossing). Only Disable moves to Disabled.
+        session.state = CaptureSessionState::Enabled;
         session.activated_at = None;
         if let Some(ref active) = state.active_session {
             if active == session_id {
