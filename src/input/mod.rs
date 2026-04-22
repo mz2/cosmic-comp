@@ -247,16 +247,20 @@ impl State {
                     if let Ok(state) = ic_state.lock() {
                         if let Some(session) = state.sessions.get(&active_session_id) {
                             if let Some(ref eis) = session.eis_connection {
-                                Self::forward_input_to_eis(&event, eis);
-                                static REDIR_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                                let n = REDIR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if n < 3 {
-                                    tracing::warn!(
-                                        %active_session_id,
-                                        session_state = ?session.state,
-                                        "Input capture: redirected event #{} to EIS",
-                                        n
-                                    );
+                                if !Self::forward_input_to_eis(&event, eis) {
+                                    tracing::warn!("Input capture: EIS forward failed (broken pipe), releasing");
+                                    should_release = true;
+                                } else {
+                                    static REDIR_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                                    let n = REDIR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if n < 3 {
+                                        tracing::warn!(
+                                            %active_session_id,
+                                            session_state = ?session.state,
+                                            "Input capture: redirected event #{} to EIS",
+                                            n
+                                        );
+                                    }
                                 }
                             } else {
                                 // EIS connection gone — release
@@ -1795,10 +1799,12 @@ impl State {
     }
 
     /// Forward an input event to the EIS connection for the active capture session.
+    /// Returns false if the EIS connection is broken (flush failed).
     fn forward_input_to_eis<B: InputBackend>(
         event: &InputEvent<B>,
         eis: &crate::dbus::input_capture::EisConnection,
-    ) where
+    ) -> bool
+    where
         <B as InputBackend>::Device: 'static,
     {
         use smithay::backend::input::Event;
@@ -1824,18 +1830,21 @@ impl State {
                     eis.pointer_device.frame(time_us);
                     match eis.connection.flush() {
                         Ok(_) => {
-                            // Log first few events at warn level for debugging
                             static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                             let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if n < 5 {
                                 tracing::warn!(dx = delta.x, dy = delta.y, "EIS: forwarded pointer motion #{}", n);
                             }
                         }
-                        Err(e) => tracing::warn!("EIS flush failed: {}", e),
+                        Err(e) => {
+                            tracing::warn!("EIS flush failed: {}", e);
+                            return false;
+                        }
                     }
                 } else {
                     static ONCE: std::sync::Once = std::sync::Once::new();
                     ONCE.call_once(|| tracing::warn!("EIS: no Pointer interface on device"));
+                    return false;
                 }
             }
             InputEvent::Keyboard { event, .. } => {
@@ -1849,7 +1858,7 @@ impl State {
                     };
                     keyboard.key(keycode.raw(), eis_state);
                     eis.keyboard_device.frame(time_us);
-                    let _ = eis.connection.flush();
+                    if eis.connection.flush().is_err() { return false; }
                     trace!(?keycode, ?state, "Forwarded keyboard event to EIS");
                 }
             }
@@ -1866,7 +1875,7 @@ impl State {
                     };
                     button_iface.button(event.button_code(), eis_state);
                     eis.pointer_device.frame(time_us);
-                    let _ = eis.connection.flush();
+                    if eis.connection.flush().is_err() { return false; }
                     trace!(
                         button = event.button_code(),
                         "Forwarded button event to EIS"
@@ -1880,7 +1889,7 @@ impl State {
                     if h != 0.0 || v != 0.0 {
                         scroll.scroll(h, v);
                         eis.pointer_device.frame(time_us);
-                        let _ = eis.connection.flush();
+                        if eis.connection.flush().is_err() { return false; }
                         trace!(h, v, "Forwarded scroll event to EIS");
                     }
                 }
@@ -1890,6 +1899,7 @@ impl State {
                 trace!("Input event type not forwarded to EIS");
             }
         }
+        true
     }
 
     /// Determine is key event should be intercepted as a key binding, or forwarded to surface
