@@ -74,6 +74,8 @@ pub struct CaptureSession {
     pub activation_id: u32,
     pub eis_fd: Option<std::os::fd::OwnedFd>,
     pub eis_connection: Option<EisConnection>,
+    /// When the session was last activated (for debouncing premature Release calls)
+    pub activated_at: Option<std::time::Instant>,
 }
 
 /// D-Bus signal events sent from compositor to the D-Bus service thread
@@ -311,6 +313,7 @@ impl InputCaptureInterface {
                     activation_id: 0,
                     eis_fd: None,
                     eis_connection: None,
+                    activated_at: None,
                 },
             );
         }
@@ -479,7 +482,29 @@ impl InputCaptureInterface {
             .get_mut(session_id)
             .ok_or_else(|| zbus::fdo::Error::Failed("Session not found".into()))?;
 
+        // Debounce: ignore Release calls that arrive within 500ms of activation.
+        // Deskflow's handleActivated warps the cursor to the barrier position on
+        // the primary screen, which triggers its own screen detection to think the
+        // cursor "came back", calling enter(primary) → release(). This happens
+        // within milliseconds of Activated. By holding the capture for 500ms, we
+        // give the EIS events time to reach Deskflow and trigger the actual screen
+        // switch.
+        if let Some(activated_at) = session.activated_at {
+            let elapsed = activated_at.elapsed();
+            if elapsed < std::time::Duration::from_millis(500) {
+                tracing::warn!(
+                    session_id,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "Ignoring premature Release ({}ms since activation, need 500ms)",
+                    elapsed.as_millis()
+                );
+                drop(state);
+                return Ok(());
+            }
+        }
+
         session.state = CaptureSessionState::Disabled;
+        session.activated_at = None;
         if let Some(ref active) = state.active_session {
             if active == session_id {
                 state.active_session = None;

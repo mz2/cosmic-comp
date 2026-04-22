@@ -530,6 +530,7 @@ impl State {
                                     session.state =
                                         crate::dbus::input_capture::CaptureSessionState::Activated;
                                     session.activation_id = activation_id;
+                                    session.activated_at = Some(std::time::Instant::now());
 
                                     // Resume EIS devices and start emulating
                                     if let Some(ref mut eis) = session.eis_connection {
