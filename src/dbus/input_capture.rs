@@ -482,24 +482,39 @@ impl InputCaptureInterface {
             .get_mut(session_id)
             .ok_or_else(|| zbus::fdo::Error::Failed("Session not found".into()))?;
 
-        // Debounce: ignore Release calls that arrive within 500ms of activation.
-        // Deskflow's handleActivated warps the cursor to the barrier position on
-        // the primary screen, which triggers its own screen detection to think the
-        // cursor "came back", calling enter(primary) → release(). This happens
-        // within milliseconds of Activated. By holding the capture for 500ms, we
-        // give the EIS events time to reach Deskflow and trigger the actual screen
-        // switch.
-        if let Some(activated_at) = session.activated_at {
-            let elapsed = activated_at.elapsed();
-            if elapsed < std::time::Duration::from_millis(50) {
+        // Guard against spurious Release calls from Deskflow.
+        //
+        // When a barrier is crossed, Deskflow's handleActivated warps the cursor
+        // to the barrier position, which triggers its own screen detection to call
+        // enter(primary) → release(). This spurious Release arrives within ~7ms
+        // and may carry a stale activation_id (from the previous cycle).
+        //
+        // Two checks:
+        // 1. activation_id mismatch → definitely spurious (stale ID from old cycle)
+        // 2. Very fast Release (<20ms) → likely spurious even with correct ID
+        //    (no human can complete a Mac round-trip in <20ms)
+        if session.state == CaptureSessionState::Activated {
+            if activation_id != session.activation_id {
                 tracing::warn!(
                     session_id,
-                    elapsed_ms = elapsed.as_millis() as u64,
-                    "Ignoring premature Release ({}ms since activation, need 50ms)",
-                    elapsed.as_millis()
+                    got = activation_id,
+                    expected = session.activation_id,
+                    "Ignoring Release with stale activation_id"
                 );
                 drop(state);
                 return Ok(());
+            }
+            if let Some(activated_at) = session.activated_at {
+                let elapsed = activated_at.elapsed();
+                if elapsed < std::time::Duration::from_millis(20) {
+                    tracing::warn!(
+                        session_id,
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        "Ignoring Release within 20ms of activation"
+                    );
+                    drop(state);
+                    return Ok(());
+                }
             }
         }
 
