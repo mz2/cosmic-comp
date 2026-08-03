@@ -9,15 +9,47 @@ use std::{
     cell::{RefCell, RefMut},
     collections::HashMap,
     rc::Rc,
+    sync::{Arc, Mutex},
 };
 use tracing::{error, warn};
 
 pub mod a11y_keyboard_monitor;
 use a11y_keyboard_monitor::A11yKeyboardMonitorState;
+pub mod input_capture;
 #[cfg(feature = "logind")]
 pub mod logind;
 mod name_owners;
 mod power;
+
+/// Initialize the InputCapture D-Bus service and wire its event channel into
+/// the compositor event loop. Returns the shared state on success.
+pub fn init_input_capture(
+    evlh: &LoopHandle<'static, State>,
+) -> Option<Arc<Mutex<input_capture::InputCaptureState>>> {
+    match input_capture::init() {
+        Ok((rx, ic_state)) => {
+            match evlh.insert_source(rx, |event, _, state| match event {
+                calloop::channel::Event::Msg(ic_event) => {
+                    state.handle_input_capture_event(ic_event);
+                }
+                calloop::channel::Event::Closed => (),
+            }) {
+                Ok(_token) => Some(ic_state),
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        "Failed to add input capture channel to event_loop"
+                    );
+                    None
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(?err, "Failed to initialize InputCapture D-Bus service");
+            None
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct DBusState(Rc<DBusStateInner>);

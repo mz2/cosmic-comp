@@ -171,6 +171,128 @@ impl State {
     {
         crate::wayland::handlers::output_power::set_all_surfaces_dpms_on(self);
 
+        // One-time diagnostic: log input_capture_state status
+        {
+            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let has_state = self.common.input_capture_state.is_some();
+                tracing::warn!(has_state, "InputCapture: input_capture_state initialized");
+            }
+        }
+
+        // Check if input capture is active - if so, redirect most input events
+        // to the EIS connection instead of processing them normally.
+        // The force-disable shortcut (Super+Shift+Escape) is always checked first.
+        {
+            let capture_active = self
+                .common
+                .input_capture_state
+                .as_ref()
+                .and_then(|ic| ic.lock().ok())
+                .as_ref()
+                .and_then(|state| state.active_session.clone());
+
+            if let Some(active_session_id) = capture_active {
+                // Check for force-disable shortcut (Super+Shift+Escape)
+                let is_escape_shortcut = if let InputEvent::Keyboard { ref event, .. } = event {
+                    use smithay::backend::input::KeyboardKeyEvent;
+                    let keycode = event.key_code();
+                    // Escape key: evdev=1, xkb=9 (smithay returns xkb keycodes)
+                    if keycode == Keycode::new(9) && event.state() == KeyState::Pressed {
+                        let shell = self.common.shell.read();
+                        let seat = shell.seats.last_active().clone();
+                        let keyboard = seat.get_keyboard().unwrap();
+                        let mods = keyboard.modifier_state();
+                        mods.logo && mods.shift
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if is_escape_shortcut {
+                    tracing::warn!("Force-disabling input capture (Super+Shift+Escape)");
+                    if let Some(ref ic_state) = self.common.input_capture_state {
+                        if let Ok(mut state) = ic_state.lock() {
+                            let activation_id = state
+                                .sessions
+                                .get(&active_session_id)
+                                .map(|s| s.activation_id)
+                                .unwrap_or(0);
+                            if let Some(session) = state.sessions.get_mut(&active_session_id) {
+                                // Stop emulating and pause EIS devices
+                                if let Some(ref eis) = session.eis_connection {
+                                    eis.pointer_device.stop_emulating();
+                                    eis.keyboard_device.stop_emulating();
+                                    eis.pointer_device.paused();
+                                    eis.keyboard_device.paused();
+                                    let _ = eis.connection.flush();
+                                }
+                                session.state =
+                                    crate::dbus::input_capture::CaptureSessionState::Disabled;
+                            }
+                            state.active_session = None;
+                            // Emit Deactivated signal
+                            state.emit_signal(
+                                crate::dbus::input_capture::SignalEvent::Deactivated {
+                                    session_id: active_session_id.clone(),
+                                    activation_id,
+                                },
+                            );
+                        }
+                    }
+                    return;
+                }
+
+                // During active capture, forward input events to EIS.
+                // If the session is gone or EIS is disconnected, release capture
+                // to prevent stuck input.
+                let mut should_release = false;
+                if let Some(ref ic_state) = self.common.input_capture_state {
+                    if let Ok(state) = ic_state.lock() {
+                        if let Some(session) = state.sessions.get(&active_session_id) {
+                            if let Some(ref eis) = session.eis_connection {
+                                if !Self::forward_input_to_eis(&event, eis) {
+                                    tracing::warn!("Input capture: EIS forward failed (broken pipe), releasing");
+                                    should_release = true;
+                                } else {
+                                    static REDIR_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                                    let n = REDIR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if n < 3 {
+                                        tracing::warn!(
+                                            %active_session_id,
+                                            session_state = ?session.state,
+                                            "Input capture: redirected event #{} to EIS",
+                                            n
+                                        );
+                                    }
+                                }
+                            } else {
+                                // EIS connection gone — release
+                                tracing::warn!("Input capture: EIS connection gone, releasing");
+                                should_release = true;
+                            }
+                        } else {
+                            // Session gone — release
+                            tracing::warn!("Input capture: session gone, releasing");
+                            should_release = true;
+                        }
+                    }
+                }
+                if should_release {
+                    if let Some(ref ic_state) = self.common.input_capture_state {
+                        if let Ok(mut state) = ic_state.lock() {
+                            state.active_session = None;
+                        }
+                    }
+                    // Don't return — process this event normally
+                } else {
+                    return;
+                }
+            }
+        }
+
         use smithay::backend::input::Event;
         match event {
             InputEvent::DeviceAdded { device } => {
@@ -372,6 +494,122 @@ impl State {
 
                     let original_position = position;
                     position += event.delta().as_global();
+
+                    // Check for input capture barrier crossing.
+                    let barrier_crossed =
+                        self.common
+                            .input_capture_state
+                            .as_ref()
+                            .and_then(|ic_state| {
+                                let mut state = ic_state.lock().ok()?;
+                                if state.active_session.is_some() {
+                                    return None;
+                                }
+                                let from = (original_position.x, original_position.y);
+                                let to = (position.x, position.y);
+
+                                // Diagnostic: log barrier state periodically when near edges
+                                let near_edge = to.0 < 5.0 || to.1 < 5.0
+                                    || to.0 > 3435.0 || to.1 > 1435.0;
+                                if near_edge {
+                                    let session_count = state.sessions.len();
+                                    let enabled_sessions: Vec<_> = state.sessions.iter()
+                                        .filter(|(_, s)| s.state == crate::dbus::input_capture::CaptureSessionState::Enabled)
+                                        .map(|(id, s)| format!("{}({} barriers)", id, s.barriers.len()))
+                                        .collect();
+                                    let all_barriers: Vec<_> = state.sessions.values()
+                                        .flat_map(|s| s.barriers.iter())
+                                        .map(|b| format!("id={} ({},{})→({},{})", b.id, b.x1, b.y1, b.x2, b.y2))
+                                        .collect();
+                                    tracing::warn!(
+                                        from_x = from.0,
+                                        from_y = from.1,
+                                        to_x = to.0,
+                                        to_y = to.1,
+                                        session_count,
+                                        ?enabled_sessions,
+                                        ?all_barriers,
+                                        "InputCapture: cursor near edge, checking barriers"
+                                    );
+                                }
+                                let (barrier_id, session_id, intersection) =
+                                    state.check_barrier_crossing(from, to)?;
+
+                                // Only activate if the session has an EIS connection ready.
+                                // Without EIS, input would be dropped with no way to recover.
+                                let session = state.sessions.get_mut(&session_id);
+                                let has_eis = session.as_ref()
+                                    .map(|s| s.eis_connection.is_some())
+                                    .unwrap_or(false);
+                                if !has_eis {
+                                    tracing::warn!(
+                                        %session_id,
+                                        "Barrier crossed but no EIS connection — not activating"
+                                    );
+                                    return None;
+                                }
+
+                                // Activate the capture session
+                                state.next_activation_id += 1;
+                                let activation_id = state.next_activation_id;
+                                if let Some(session) = state.sessions.get_mut(&session_id) {
+                                    session.state =
+                                        crate::dbus::input_capture::CaptureSessionState::Activated;
+                                    session.activation_id = activation_id;
+                                    session.activated_at = Some(std::time::Instant::now());
+
+                                    // Resume EIS devices and start emulating
+                                    if let Some(ref mut eis) = session.eis_connection {
+                                        eis.sequence += 1;
+                                        eis.pointer_device.resumed();
+                                        eis.keyboard_device.resumed();
+                                        eis.pointer_device.start_emulating(eis.sequence);
+                                        eis.keyboard_device.start_emulating(eis.sequence);
+                                        let _ = eis.connection.flush();
+                                    }
+                                }
+                                state.active_session = Some(session_id.clone());
+
+                                // Emit Activated D-Bus signal
+                                state.emit_signal(
+                                    crate::dbus::input_capture::SignalEvent::Activated {
+                                        session_id: session_id.clone(),
+                                        barrier_id,
+                                        activation_id,
+                                        cursor_position: intersection,
+                                    },
+                                );
+
+                                tracing::info!(
+                                    barrier_id,
+                                    %session_id,
+                                    activation_id,
+                                    ?intersection,
+                                    "Input capture barrier crossed, activating"
+                                );
+                                Some(intersection)
+                            });
+                    if let Some(intersection) = barrier_crossed {
+                        // Clamp cursor to the barrier intersection point
+                        position.x = intersection.0;
+                        position.y = intersection.1;
+
+                        // Don't process further - cursor stays at barrier
+                        let serial = SERIAL_COUNTER.next_serial();
+                        let time = smithay::backend::input::Event::time_msec(&event);
+                        ptr.motion(
+                            self,
+                            under,
+                            &MotionEvent {
+                                location: position.as_logical(),
+                                serial,
+                                time,
+                            },
+                        );
+                        ptr.frame(self);
+                        return;
+                    }
+
                     let shell = self.common.shell.read();
                     let output = shell
                         .outputs()
@@ -1615,6 +1853,113 @@ impl State {
                 }
             }
         }
+    }
+
+    /// Forward an input event to the EIS connection for the active capture session.
+    /// Returns false if the EIS connection is broken (flush failed).
+    fn forward_input_to_eis<B: InputBackend>(
+        event: &InputEvent<B>,
+        eis: &crate::dbus::input_capture::EisConnection,
+    ) -> bool
+    where
+        <B as InputBackend>::Device: 'static,
+    {
+        use smithay::backend::input::Event;
+
+        // Get time in microseconds for EIS frame events
+        let time_us = match event {
+            InputEvent::Keyboard { event, .. } => Event::time_msec(event) as u64 * 1000,
+            InputEvent::PointerMotion { event, .. } => Event::time_msec(event) as u64 * 1000,
+            InputEvent::PointerMotionAbsolute { event, .. } => {
+                Event::time_msec(event) as u64 * 1000
+            }
+            InputEvent::PointerButton { event, .. } => Event::time_msec(event) as u64 * 1000,
+            InputEvent::PointerAxis { event, .. } => Event::time_msec(event) as u64 * 1000,
+            _ => 0,
+        };
+
+        match event {
+            InputEvent::PointerMotion { event, .. } => {
+                use smithay::backend::input::PointerMotionEvent;
+                let delta = event.delta();
+                if let Some(pointer) = eis.pointer_device.interface::<reis::eis::Pointer>() {
+                    pointer.motion_relative(delta.x as f32, delta.y as f32);
+                    eis.pointer_device.frame(time_us);
+                    match eis.connection.flush() {
+                        Ok(_) => {
+                            static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                            let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if n < 5 {
+                                tracing::warn!(dx = delta.x, dy = delta.y, "EIS: forwarded pointer motion #{}", n);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("EIS flush failed: {}", e);
+                            return false;
+                        }
+                    }
+                } else {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| tracing::warn!("EIS: no Pointer interface on device"));
+                    return false;
+                }
+            }
+            InputEvent::Keyboard { event, .. } => {
+                use smithay::backend::input::KeyboardKeyEvent;
+                let keycode = event.key_code();
+                let state = event.state();
+                if let Some(keyboard) = eis.keyboard_device.interface::<reis::eis::Keyboard>() {
+                    let eis_state = match state {
+                        KeyState::Pressed => reis::eis::keyboard::KeyState::Press,
+                        KeyState::Released => reis::eis::keyboard::KeyState::Released,
+                    };
+                    // Convert XKB keycode (smithay) to evdev keycode (EIS protocol).
+                    // smithay's key_code() returns evdev + 8.
+                    let evdev_keycode = keycode.raw().saturating_sub(8);
+                    keyboard.key(evdev_keycode, eis_state);
+                    eis.keyboard_device.frame(time_us);
+                    if eis.connection.flush().is_err() { return false; }
+                    trace!(?keycode, ?state, "Forwarded keyboard event to EIS");
+                }
+            }
+            InputEvent::PointerButton { event, .. } => {
+                use smithay::backend::input::PointerButtonEvent;
+                if let Some(button_iface) = eis.pointer_device.interface::<reis::eis::Button>() {
+                    let eis_state = match event.state() {
+                        smithay::backend::input::ButtonState::Pressed => {
+                            reis::eis::button::ButtonState::Press
+                        }
+                        smithay::backend::input::ButtonState::Released => {
+                            reis::eis::button::ButtonState::Released
+                        }
+                    };
+                    button_iface.button(event.button_code(), eis_state);
+                    eis.pointer_device.frame(time_us);
+                    if eis.connection.flush().is_err() { return false; }
+                    trace!(
+                        button = event.button_code(),
+                        "Forwarded button event to EIS"
+                    );
+                }
+            }
+            InputEvent::PointerAxis { event, .. } => {
+                if let Some(scroll) = eis.pointer_device.interface::<reis::eis::Scroll>() {
+                    let h = event.amount(Axis::Horizontal).unwrap_or(0.0) as f32;
+                    let v = event.amount(Axis::Vertical).unwrap_or(0.0) as f32;
+                    if h != 0.0 || v != 0.0 {
+                        scroll.scroll(h, v);
+                        eis.pointer_device.frame(time_us);
+                        if eis.connection.flush().is_err() { return false; }
+                        trace!(h, v, "Forwarded scroll event to EIS");
+                    }
+                }
+            }
+            _ => {
+                // Other events (touch, tablet, etc.) are not forwarded
+                trace!("Input event type not forwarded to EIS");
+            }
+        }
+        true
     }
 
     /// Determine is key event should be intercepted as a key binding, or forwarded to surface

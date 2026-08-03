@@ -128,7 +128,7 @@ use std::{
     collections::HashSet,
     ffi::OsString,
     process::{Child, Command},
-    sync::{Arc, LazyLock, Once, atomic::AtomicBool},
+    sync::{Arc, LazyLock, Mutex, Once, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 
@@ -303,6 +303,8 @@ pub struct Common {
     pub inhibit_lid_fd: Option<OwnedFd>,
 
     pub with_xwayland: bool,
+
+    pub input_capture_state: Option<Arc<Mutex<crate::dbus::input_capture::InputCaptureState>>>,
 }
 
 #[derive(Debug)]
@@ -737,6 +739,8 @@ impl State {
         );
         let workspace_state = WorkspaceState::new(dh, client_not_sandboxed);
 
+        let input_capture_state = crate::dbus::init_input_capture(&handle);
+
         let a11y_state = A11yState::new::<State, _>(dh, client_not_sandboxed);
 
         let dbus_state = DBusState::init(&handle);
@@ -810,6 +814,8 @@ impl State {
                 inhibit_lid_fd: None,
 
                 with_xwayland,
+
+                input_capture_state,
             },
             backend: BackendData::Unset,
             ready: Once::new(),
@@ -918,6 +924,336 @@ impl State {
                     }
                 }
                 // drop _fd
+            }
+        }
+    }
+
+    pub fn handle_input_capture_event(
+        &mut self,
+        event: crate::dbus::input_capture::InputCaptureEvent,
+    ) {
+        use crate::dbus::input_capture::InputCaptureEvent;
+        match event {
+            InputCaptureEvent::SessionCreated {
+                session_id,
+                capabilities,
+            } => {
+                tracing::info!(session_id, capabilities, "Input capture session created");
+                // Update zones from current output layout
+                self.update_input_capture_zones();
+            }
+            InputCaptureEvent::SessionClosed { session_id } => {
+                tracing::info!(session_id, "Input capture session closed");
+            }
+            InputCaptureEvent::BarriersSet {
+                session_id,
+                barriers,
+                zone_set,
+            } => {
+                tracing::info!(
+                    session_id,
+                    barrier_count = barriers.len(),
+                    zone_set,
+                    "Input capture barriers set"
+                );
+            }
+            InputCaptureEvent::Enabled { session_id } => {
+                tracing::info!(session_id, "Input capture session enabled");
+            }
+            InputCaptureEvent::Disabled { session_id } => {
+                tracing::info!(session_id, "Input capture session disabled");
+            }
+            InputCaptureEvent::Released {
+                session_id,
+                activation_id,
+                cursor_position,
+            } => {
+                tracing::info!(
+                    session_id,
+                    activation_id,
+                    ?cursor_position,
+                    "Input capture session released"
+                );
+
+                // Pause EIS devices and emit Deactivated signal
+                if let Some(ref ic_state) = self.common.input_capture_state {
+                    if let Ok(mut state) = ic_state.lock() {
+                        if let Some(session) = state.sessions.get_mut(&session_id) {
+                            if let Some(ref eis) = session.eis_connection {
+                                eis.pointer_device.stop_emulating();
+                                eis.keyboard_device.stop_emulating();
+                                eis.pointer_device.paused();
+                                eis.keyboard_device.paused();
+                                let _ = eis.connection.flush();
+                            }
+                        }
+                        state.emit_signal(crate::dbus::input_capture::SignalEvent::Deactivated {
+                            session_id: session_id.clone(),
+                            activation_id,
+                        });
+                    }
+                }
+
+                // Warp cursor to the requested position and clear active session
+                if let Some(ref ic_state) = self.common.input_capture_state {
+                    if let Ok(mut state) = ic_state.lock() {
+                        state.active_session = None;
+                    }
+                }
+                if let Some((x, y)) = cursor_position {
+                    use smithay::utils::{Logical, SERIAL_COUNTER};
+                    let shell = self.common.shell.read();
+                    let seat = shell.seats.last_active().clone();
+                    std::mem::drop(shell);
+                    if let Some(ptr) = seat.get_pointer() {
+                        let location = Point::<f64, Logical>::from((x, y));
+                        let serial = SERIAL_COUNTER.next_serial();
+                        ptr.motion(
+                            self,
+                            None,
+                            &smithay::input::pointer::MotionEvent {
+                                location,
+                                serial,
+                                time: 0,
+                            },
+                        );
+                        ptr.frame(self);
+                        tracing::info!(x, y, "Warped cursor after input capture release");
+                    }
+                }
+            }
+            InputCaptureEvent::ConnectEIS {
+                session_id,
+                server_fd,
+            } => {
+                tracing::info!(session_id, "EIS connection requested");
+
+                // Convert OwnedFd to UnixStream for reis
+                let server_stream: std::os::unix::net::UnixStream = server_fd.into();
+
+                match reis::eis::Context::new(server_stream) {
+                    Ok(context) => {
+                        // Create a calloop event source for the EIS context to handle client
+                        // handshake and requests. We use the EisRequestSource which handles
+                        // the handshake automatically.
+                        let eis_source = reis::calloop::EisRequestSource::new(context.clone(), 1);
+
+                        let ic_state = self.common.input_capture_state.clone();
+                        let eis_session_id = session_id.clone();
+
+                        match self.common.event_loop_handle.insert_source(
+                            eis_source,
+                            move |event, connection, _state| {
+                                match event {
+                                    Ok(reis::calloop::EisRequestSourceEvent::Connected) => {
+                                        tracing::info!(
+                                            session_id = %eis_session_id,
+                                            "EIS client connected, setting up seat and devices"
+                                        );
+                                        // Now that handshake is complete, create seat and devices
+                                        Self::setup_eis_devices(
+                                            &ic_state,
+                                            &eis_session_id,
+                                            connection,
+                                        );
+                                    }
+                                    Ok(reis::calloop::EisRequestSourceEvent::Request(
+                                        reis::request::EisRequest::Bind(bind),
+                                    )) => {
+                                        tracing::info!(
+                                            session_id = %eis_session_id,
+                                            ?bind.capabilities,
+                                            "EIS client bound seat capabilities"
+                                        );
+                                    }
+                                    Ok(reis::calloop::EisRequestSourceEvent::Request(
+                                        reis::request::EisRequest::Disconnect,
+                                    )) => {
+                                        tracing::warn!(
+                                            session_id = %eis_session_id,
+                                            "EIS client disconnected — releasing input capture"
+                                        );
+                                        if let Some(ref ic) = ic_state {
+                                            if let Ok(mut state) = ic.lock() {
+                                                // Clear active session to restore normal input
+                                                if state.active_session.as_deref() == Some(&eis_session_id) {
+                                                    state.active_session = None;
+                                                    tracing::warn!("Cleared active input capture session");
+                                                }
+                                                // Remove the entire session — it's dead
+                                                state.sessions.remove(&eis_session_id);
+                                                tracing::warn!(
+                                                    session_id = %eis_session_id,
+                                                    remaining = state.sessions.len(),
+                                                    "Removed disconnected session"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Ok(reis::calloop::EisRequestSourceEvent::Request(req)) => {
+                                        tracing::debug!(
+                                            session_id = %eis_session_id,
+                                            ?req,
+                                            "EIS request (ignored, we are the sender)"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            session_id = %eis_session_id,
+                                            "EIS error: {} — releasing input capture",
+                                            e
+                                        );
+                                        // EIS socket error — release capture to prevent stuck input
+                                        if let Some(ref ic) = ic_state {
+                                            if let Ok(mut state) = ic.lock() {
+                                                if state.active_session.as_deref() == Some(&eis_session_id) {
+                                                    state.active_session = None;
+                                                    tracing::warn!("Cleared active input capture session on EIS error");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(calloop::PostAction::Continue)
+                            },
+                        ) {
+                            Ok(_token) => {
+                                tracing::info!(
+                                    session_id,
+                                    "EIS event source registered with calloop"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    session_id,
+                                    "Failed to register EIS event source: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(session_id, "Failed to create EIS context from fd: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Set up EIS seat and devices after handshake completes.
+    /// Called from the calloop EIS event source callback.
+    fn setup_eis_devices(
+        ic_state: &Option<Arc<Mutex<crate::dbus::input_capture::InputCaptureState>>>,
+        session_id: &str,
+        connection: &mut reis::request::Connection,
+    ) {
+        use reis::request::DeviceCapability;
+
+        // Get output zones for setting device regions
+        let zones: Vec<crate::dbus::input_capture::Zone> = ic_state
+            .as_ref()
+            .and_then(|ic| ic.lock().ok())
+            .map(|state| state.zones.clone())
+            .unwrap_or_default();
+
+        let seat_capabilities = DeviceCapability::Pointer
+            | DeviceCapability::Keyboard
+            | DeviceCapability::Button
+            | DeviceCapability::Scroll;
+
+        let seat = connection.add_seat(Some("default"), seat_capabilities);
+
+        // Add pointer device with pointer, button, and scroll capabilities
+        // Set regions so the EIS client knows the screen geometry
+        let pointer_capabilities =
+            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll;
+        let zones_for_cb = zones.clone();
+        let pointer_device = seat.add_device(
+            Some("pointer"),
+            reis::eis::device::DeviceType::Virtual,
+            pointer_capabilities,
+            move |device| {
+                // Set regions on the device matching the output layout
+                let eis_device = device.device();
+                if zones_for_cb.is_empty() {
+                    // Fallback: single 1920x1080 region
+                    eis_device.region(0, 0, 1920, 1080, 1.0);
+                    tracing::info!("EIS pointer: fallback region 1920x1080@0,0");
+                } else {
+                    for zone in &zones_for_cb {
+                        eis_device.region(
+                            zone.x as u32,
+                            zone.y as u32,
+                            zone.width,
+                            zone.height,
+                            1.0,
+                        );
+                        tracing::info!(
+                            "EIS pointer: region {}x{}@{},{}",
+                            zone.width, zone.height, zone.x, zone.y
+                        );
+                    }
+                }
+            },
+        );
+
+        // Add keyboard device
+        let keyboard_device = seat.add_device(
+            Some("keyboard"),
+            reis::eis::device::DeviceType::Virtual,
+            DeviceCapability::Keyboard.into(),
+            |_device| {},
+        );
+
+        if let Err(e) = connection.flush() {
+            tracing::error!("Failed to flush EIS connection after setup: {}", e);
+            return;
+        }
+
+        tracing::info!(
+            session_id,
+            "EIS seat and devices created (pointer + keyboard)"
+        );
+
+        // Store the EIS connection state in the session
+        if let Some(ic) = ic_state {
+            if let Ok(mut state) = ic.lock() {
+                if let Some(session) = state.sessions.get_mut(session_id) {
+                    session.eis_connection = Some(crate::dbus::input_capture::EisConnection {
+                        connection: connection.clone(),
+                        seat,
+                        pointer_device,
+                        keyboard_device,
+                        sequence: 0,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Update input capture zones from current output layout
+    pub fn update_input_capture_zones(&self) {
+        if let Some(ref ic_state) = self.common.input_capture_state {
+            let shell = self.common.shell.read();
+            let zones: Vec<crate::dbus::input_capture::Zone> = shell
+                .outputs()
+                .map(|output| {
+                    let geo = output.geometry();
+                    crate::dbus::input_capture::Zone {
+                        width: geo.size.w as u32,
+                        height: geo.size.h as u32,
+                        x: geo.loc.x,
+                        y: geo.loc.y,
+                    }
+                })
+                .collect();
+            if let Ok(mut state) = ic_state.lock() {
+                state.update_zones(zones);
+                tracing::debug!(
+                    zone_count = state.zones.len(),
+                    zone_set = state.zone_set,
+                    "Updated input capture zones"
+                );
             }
         }
     }
